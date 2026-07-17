@@ -1,2 +1,4 @@
 inputs
 pydirectinput
+customtkinter
+Pillow
