@@ -1,18 +1,67 @@
 # ==============================================================================
 # GUI do LoL Controller — Interface com controle visual e calibração
 # ==============================================================================
+"""GUI do LoL Controller (customtkinter).
+
+Este módulo implementa toda a interface gráfica do app: o diagrama visual do
+controle e a barra de habilidades do LoL (aba "Mapeamento"), onde o usuário
+associa botões físicos a teclas/ações; a aba "Configurações" (resolução,
+raio de mira, deadzone, inversão de eixos); o painel de detecção ao vivo de
+input do gamepad; e o `CalibrationWizard`, um assistente passo-a-passo que
+detecta automaticamente os códigos de botão/eixo de um controle não-padrão.
+O botão Iniciar/Parar do cabeçalho roda o loop de controle de main.py em uma
+thread de segundo plano.
+"""
 import customtkinter as ctk
 import tkinter as tk
 import threading
 import queue
 import os
 import sys
+import ctypes
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Quando congelado pelo PyInstaller (onefile), os dados embarcados (icon.ico e
+# os assets do customtkinter) sao extraidos para sys._MEIPASS; ao rodar do
+# codigo-fonte, cai no diretorio do proprio arquivo.
+SCRIPT_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 import config
+
+# Declara o processo como "DPI aware" o quanto antes, antes de qualquer janela
+# Tk/CTk ser criada. Sem isso, em displays com escala (125%/150%/etc.) o
+# Windows escala a janela e as coordenadas de tela reportadas ficam erradas,
+# o que desalinha a matemática de mira em aim_math.py (que usa GetSystemMetrics
+# e SetCursorPos em coordenadas físicas). Antes, isso só funcionava por efeito
+# colateral não documentado do customtkinter.
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+# Lock global para evitar que duas threads leitoras de gamepad (o painel de
+# detecção e o assistente de calibração) chamem get_gamepad() simultaneamente
+# sobre o mesmo dispositivo — a lib 'inputs' não é segura para múltiplos
+# leitores concorrentes e os eventos acabam se perdendo/dividindo entre filas.
+_gamepad_reader_lock = threading.Lock()
+
+
+def _get_system_resolution():
+    """Retorna (largura, altura) da tela principal via Win32 GetSystemMetrics,
+    ou None se a chamada falhar (ex.: rodando fora do Windows)."""
+    try:
+        user32 = ctypes.windll.user32
+        w = user32.GetSystemMetrics(0)   # SM_CXSCREEN
+        h = user32.GetSystemMetrics(1)   # SM_CYSCREEN
+        if w > 0 and h > 0:
+            return w, h
+    except Exception:
+        pass
+    return None
 
 # ==============================================================================
 # CONSTANTES DE DESIGN
@@ -32,6 +81,16 @@ TEXT_PRIMARY = "#f1f5f9"
 TEXT_SECONDARY = "#94a3b8"
 TEXT_MUTED = "#64748b"
 BORDER_COLOR = "#2e2e5e"
+BORDER_COLOR_STRONG = "#3f3f7a"
+
+# Escala de espaçamento consistente, usada em todo o layout em vez de valores
+# soltos de padx/pady — evita a mistura de gaps de 4px e 20px lado a lado que
+# fazia o layout parecer espremido em uns lugares e desalinhado em outros.
+PAD_XS = 6
+PAD_SM = 10
+PAD_MD = 16
+PAD_LG = 22
+PAD_XL = 30
 
 # Nomes amigáveis dos botões
 BUTTON_LABELS = {
@@ -56,7 +115,7 @@ BUTTON_LABELS = {
 BUTTON_DESCRIPTIONS = {
     "SQUARE": "Habilidade Q", "TRIANGLE": "Habilidade W",
     "CIRCLE": "Habilidade E", "CROSS": "Habilidade R (Ultimate)",
-    "R1": "Feitiço 1 (D)", "L1": "Feitiço 2 (F)",
+    "R1": "Feitiço 2 (F)", "L1": "Feitiço 1 (Q)",
     "DPAD_UP": "Item 1", "DPAD_RIGHT": "Item 2",
     "DPAD_DOWN": "Item 3", "DPAD_LEFT": "Item 4",
     "L2": "Gatilho L2 / LT", "R2": "Gatilho R2 / RT",
@@ -77,30 +136,34 @@ AVAILABLE_KEYS = [
 # WIDGET DE ANALÓGICO VISUAL
 # ==============================================================================
 class AnalogStickWidget(ctk.CTkFrame):
-    def __init__(self, parent, label_text, size=80):
-        super().__init__(parent, fg_color="transparent", width=size, height=size + 22)
+    """Pequeno widget de canvas que desenha a posição ao vivo de um analógico
+    (bolinha dentro de um círculo), colorida de acordo com a magnitude do
+    deslocamento — usado no diagrama do controle e no painel de detecção."""
+
+    def __init__(self, parent, label_text, size=104):
+        super().__init__(parent, fg_color="transparent", width=size, height=size + 24)
         self.pack_propagate(False)
         self.size = size
         self.center = size // 2
-        self.stick_radius = (size // 2) - 10
+        self.stick_radius = (size // 2) - 12
 
         self.canvas = tk.Canvas(self, width=size, height=size,
                                 bg=BG_INPUT, highlightthickness=0, bd=0)
         self.canvas.pack()
         pad = 6
         self.canvas.create_oval(pad, pad, size - pad, size - pad,
-                                outline=BORDER_COLOR, width=2, fill=BG_DARK)
+                                outline=BORDER_COLOR_STRONG, width=2, fill=BG_DARK)
         c = self.center
         self.canvas.create_line(c, pad + 2, c, size - pad - 2, fill="#1e1e45", width=1)
         self.canvas.create_line(pad + 2, c, size - pad - 2, c, fill="#1e1e45", width=1)
-        dot_r = 5
+        dot_r = 6
         self.dot = self.canvas.create_oval(c - dot_r, c - dot_r, c + dot_r, c + dot_r,
                                            fill=ACCENT_SECONDARY, outline="#22d3ee", width=1)
-        ctk.CTkLabel(self, text=label_text, font=ctk.CTkFont(size=10),
-                     text_color=TEXT_MUTED).pack(pady=(2, 0))
+        ctk.CTkLabel(self, text=label_text, font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=TEXT_SECONDARY).pack(pady=(6, 0))
 
     def update_position(self, x, y):
-        dot_r = 5
+        dot_r = 6
         px = self.center + int(x * self.stick_radius)
         py = self.center + int(y * self.stick_radius)
         self.canvas.coords(self.dot, px - dot_r, py - dot_r, px + dot_r, py + dot_r)
@@ -149,6 +212,8 @@ class CalibrationWizard(ctk.CTkToplevel):
         self.detect_stop = threading.Event()
         self.waiting = False
         self.assigned_codes = set()
+        self._advance_after_id = None
+        self._poll_job = None
 
         # --- Janela ---
         self.title("Calibração do Controle")
@@ -240,24 +305,58 @@ class CalibrationWizard(ctk.CTkToplevel):
         t.start()
 
     def _reader_loop(self):
+        stop = self.detect_stop
         try:
             from inputs import get_gamepad
         except ImportError:
+            self.event_queue.put(("__error__", "Biblioteca 'inputs' não encontrada"))
             return
-        while not self.detect_stop.is_set():
-            try:
-                events = get_gamepad()
-                for ev in events:
-                    if ev.ev_type == "Sync":
-                        continue
-                    if self.detect_stop.is_set():
-                        return
-                    self.event_queue.put(ev)
-            except Exception:
+
+        # Evita duas threads (calibração + painel de detecção) chamando
+        # get_gamepad() ao mesmo tempo. O leitor anterior pode ainda estar
+        # bloqueado dentro de get_gamepad() segurando o lock (ele o solta assim
+        # que o próximo evento chega), então esperamos o lock em vez de exibir
+        # um erro fatal — desistimos apenas se a calibração for cancelada antes
+        # de conseguir o lock.
+        while not stop.is_set():
+            if _gamepad_reader_lock.acquire(timeout=0.5):
                 break
+        else:
+            return
+        try:
+            while not stop.is_set():
+                try:
+                    events = get_gamepad()
+                    for ev in events:
+                        if ev.ev_type == "Sync":
+                            continue
+                        if stop.is_set():
+                            return
+                        self.event_queue.put(ev)
+                except Exception as e:
+                    self.event_queue.put(("__error__", str(e)))
+                    break
+        finally:
+            _gamepad_reader_lock.release()
 
     # ---------- Exibir passo ----------
     def _show_step(self):
+        # Cancela qualquer job de after() pendente de um passo anterior
+        # (evita pilhas de _poll_events/_auto_advance concorrentes quando o
+        # usuário clica "Pular"/"Próximo" rapidamente).
+        if self._poll_job is not None:
+            try:
+                self.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
+        if self._advance_after_id is not None:
+            try:
+                self.after_cancel(self._advance_after_id)
+            except Exception:
+                pass
+            self._advance_after_id = None
+
         if self.current_step >= len(self.STEPS):
             self._show_done()
             return
@@ -290,12 +389,24 @@ class CalibrationWizard(ctk.CTkToplevel):
         try:
             for _ in range(30):
                 ev = self.event_queue.get_nowait()
+                if isinstance(ev, tuple) and ev[0] == "__error__":
+                    self._show_error(ev[1])
+                    return
                 if self._try_match(ev):
                     return
         except queue.Empty:
             pass
         if self.waiting:
-            self.after(16, self._poll_events)
+            self._poll_job = self.after(16, self._poll_events)
+
+    def _show_error(self, message):
+        """Exibe um erro do leitor de gamepad (lib ausente, desconexão, lock
+        de leitor ocupado) em vez de deixar a tela travada em 'Aguardando
+        input...' sem explicação."""
+        self.waiting = False
+        self.feedback_lbl.configure(text=f"❌  {message}", text_color=ACCENT_DANGER)
+        self.feedback_frame.configure(fg_color="#3b0d0d", border_width=1,
+                                      border_color=ACCENT_DANGER)
 
     def _try_match(self, event):
         step_type, name, symbol, instruction = self.STEPS[self.current_step]
@@ -303,7 +414,7 @@ class CalibrationWizard(ctk.CTkToplevel):
         state = event.state
 
         if step_type == "button":
-            if event.ev_type == "Key" and state == 1:
+            if event.ev_type == "Key" and state == 1 and code not in self.assigned_codes:
                 self.results[name] = code
                 self.assigned_codes.add(code)
                 self._show_matched(f"Detectado: {code}")
@@ -311,12 +422,22 @@ class CalibrationWizard(ctk.CTkToplevel):
 
         elif step_type == "trigger":
             if event.ev_type == "Absolute":
-                is_trigger = (0 <= state <= 255 and state > 180) or (state > 20000)
+                # Além do gatilho analógico (0..255>180 ou >20000), aceita o
+                # caso em que L2/R2 chegam como eixo Absolute digital 0/1 —
+                # senão esse controle nunca casa no passo do gatilho.
+                is_trigger = (0 <= state <= 255 and state > 180) or (state > 20000) or (abs(state) == 1)
                 if is_trigger and code not in self.assigned_codes:
                     self.results[name] = code
                     self.assigned_codes.add(code)
                     self._show_matched(f"Detectado: {code} (valor {state})")
                     return True
+            elif event.ev_type == "Key" and state == 1 and code not in self.assigned_codes:
+                # Alguns controles reportam L2/R2 como botão digital (0/1)
+                # em vez de eixo analógico — aceita esse formato também.
+                self.results[name] = code
+                self.assigned_codes.add(code)
+                self._show_matched(f"Detectado: {code} (botão)")
+                return True
 
         elif step_type == "dpad":
             if event.ev_type == "Absolute" and state != 0 and abs(state) <= 1:
@@ -330,9 +451,15 @@ class CalibrationWizard(ctk.CTkToplevel):
                 return True
 
         elif step_type == "analog":
-            if event.ev_type == "Absolute" and abs(state) > 20000:
-                if code not in self.assigned_codes or abs(state) > 255:
+            # Aceita tanto eixos de 16 bits (deflexão total ~32767) quanto
+            # eixos de faixa menor (8 bits, 0..255) que nunca chegam a 20000 —
+            # espelha a lógica de faixa dupla do passo de gatilho, senão a
+            # calibração trava em "Aguardando input..." nesses controles.
+            is_analog = (abs(state) > 180 and abs(state) <= 255) or abs(state) > 20000
+            if event.ev_type == "Absolute" and is_analog:
+                if code not in self.assigned_codes:
                     self.results[name] = {"code": code, "value": state}
+                    self.assigned_codes.add(code)
                     self._show_matched(f"Detectado: {code} = {state}")
                     return True
         return False
@@ -343,7 +470,7 @@ class CalibrationWizard(ctk.CTkToplevel):
         self.feedback_frame.configure(fg_color="#0d2818", border_width=1,
                                       border_color=ACCENT_SUCCESS)
         self.next_btn.configure(state="normal")
-        self.after(700, self._auto_advance)
+        self._advance_after_id = self.after(700, self._auto_advance)
 
     def _auto_advance(self):
         if self.next_btn.cget("state") == "normal" and self.current_step < len(self.STEPS):
@@ -373,7 +500,10 @@ class CalibrationWizard(ctk.CTkToplevel):
                                 command=self._save)
 
     def _save(self):
-        layout = dict(config.DEFAULT_CONTROLLER_LAYOUT)
+        # Parte do layout JÁ calibrado atual, não do genérico hardcoded —
+        # assim, qualquer passo pulado ou sem correspondência preserva o
+        # valor calibrado anteriormente em vez de reverter para o default.
+        layout = dict(config.CONTROLLER_LAYOUT)
 
         # Botões
         for btn in ["SQUARE", "TRIANGLE", "CIRCLE", "CROSS", "L1", "R1", "L3", "R3", "START", "SELECT"]:
@@ -429,7 +559,24 @@ class CalibrationWizard(ctk.CTkToplevel):
     def _cancel(self):
         self.detect_stop.set()
         self.waiting = False
+        # Cancela quaisquer callbacks self.after() pendentes antes de
+        # destruir a janela, para não disparar TclError em widgets já
+        # destruídos quando o timer chegar.
+        if self._advance_after_id is not None:
+            try:
+                self.after_cancel(self._advance_after_id)
+            except Exception:
+                pass
+            self._advance_after_id = None
+        if self._poll_job is not None:
+            try:
+                self.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
         self.grab_release()
+        if getattr(self.parent_app, "_calibration_wizard", None) is self:
+            self.parent_app._calibration_wizard = None
         self.destroy()
 
 
@@ -437,12 +584,22 @@ class CalibrationWizard(ctk.CTkToplevel):
 # CLASSE PRINCIPAL DA GUI
 # ==============================================================================
 class LoLControllerApp(ctk.CTk):
+    """Janela principal do LoL Controller Configurator.
+
+    Possui duas abas — Mapeamento (diagrama visual do controle + barra de
+    habilidades do LoL + painel de detecção ao vivo) e Configurações
+    (resolução, raio de mira, deadzone, inversão de eixos) — e o botão
+    Iniciar/Parar do cabeçalho, que roda o loop de controle de main.py em
+    uma thread de segundo plano. Mantém o estado de config (config.py) e o
+    estado de UI (self.ctrl_buttons, self.hud_slots, self.setting_vars).
+    """
+
     def __init__(self):
         super().__init__()
 
         self.title("LoL Controller Configurator")
-        self.geometry("860x900")
-        self.minsize(800, 800)
+        self.geometry("1040x940")
+        self.minsize(960, 820)
         self.configure(fg_color=BG_DARK)
         self.resizable(True, True)
 
@@ -460,6 +617,8 @@ class LoLControllerApp(ctk.CTk):
         self.hud_slots = {}
         self.setting_vars = {}
         self.analog_state = {"lx": 0.0, "ly": 0.0, "rx": 0.0, "ry": 0.0}
+        self._calibration_wizard = None
+        self._controller_thread = None
 
         config.load_config()
         self._rebuild_detection_maps()
@@ -506,13 +665,22 @@ class LoLControllerApp(ctk.CTk):
             self.inv_rx_var.set(self._invert_rx)
             self.inv_ry_var.set(self._invert_ry)
 
+    @staticmethod
+    def _format_mapped_key(value):
+        """Texto exibido para uma tecla/ação mapeada: '—' quando vazio/None,
+        senão a tecla em maiúsculas. Usado por _make_ctrl_btn e
+        _update_all_mappings_ui para que os dois nunca divirjam (antes,
+        _make_ctrl_btn renderizava uma string em branco para um mapeamento
+        vazio como "" enquanto aqui renderizava '—')."""
+        return value.upper() if value else "—"
+
     def _update_all_mappings_ui(self):
         """Atualiza os labels no diagrama de controle e na barra de habilidades do LoL."""
         # 1. Atualizar labels no diagrama do controle
         for btn_name, info in self.ctrl_buttons.items():
             if btn_name in config.MAPPING:
                 mapped_key = config.MAPPING[btn_name]
-                info["key_label"].configure(text=mapped_key.upper() if mapped_key else "—")
+                info["key_label"].configure(text=self._format_mapped_key(mapped_key))
 
         # 2. Atualizar labels na barra do LoL
         for key_code, info in self.hud_slots.items():
@@ -535,28 +703,33 @@ class LoLControllerApp(ctk.CTk):
     # HEADER
     # ==========================================================================
     def _build_header(self):
-        header = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=0, height=70)
+        header = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=0, height=84)
         header.pack(fill="x")
         header.pack_propagate(False)
         inner = ctk.CTkFrame(header, fg_color="transparent")
-        inner.pack(fill="both", expand=True, padx=24)
+        inner.pack(fill="both", expand=True, padx=PAD_XL)
 
         title_frame = ctk.CTkFrame(inner, fg_color="transparent")
-        title_frame.pack(side="left", fill="y", pady=12)
+        title_frame.pack(side="left", fill="y", pady=PAD_MD)
         ctk.CTkLabel(title_frame, text="🎮  LoL Controller",
-                     font=ctk.CTkFont(size=22, weight="bold"),
+                     font=ctk.CTkFont(size=26, weight="bold"),
                      text_color=TEXT_PRIMARY).pack(anchor="w")
         ctk.CTkLabel(title_frame, text="Configure seu controle para jogar LoL de forma nativa e ergonômica",
                      font=ctk.CTkFont(size=12),
-                     text_color=TEXT_SECONDARY).pack(anchor="w")
+                     text_color=TEXT_SECONDARY).pack(anchor="w", pady=(3, 0))
 
         self.start_btn = ctk.CTkButton(
-            inner, text="▶  INICIAR", width=160, height=42, corner_radius=10,
-            font=ctk.CTkFont(size=14, weight="bold"),
+            inner, text="▶  INICIAR", width=180, height=48, corner_radius=10,
+            font=ctk.CTkFont(size=15, weight="bold"),
             fg_color=ACCENT_SUCCESS, hover_color="#0d9668", text_color="#ffffff",
             command=self._toggle_script,
         )
-        self.start_btn.pack(side="right", pady=14)
+        self.start_btn.pack(side="right", pady=PAD_MD)
+
+        # Linha de destaque sutil separando o header do resto da janela — dá
+        # uma "borda" visual em vez do header se misturar direto com o fundo.
+        ctk.CTkFrame(self, fg_color=BORDER_COLOR_STRONG, height=1,
+                     corner_radius=0).pack(fill="x")
 
     # ==========================================================================
     # TABS
@@ -570,8 +743,17 @@ class LoLControllerApp(ctk.CTk):
             segmented_button_unselected_color=BG_CARD,
             segmented_button_unselected_hover_color=BG_CARD_HOVER,
             text_color=TEXT_PRIMARY, corner_radius=12,
+            anchor="center",
         )
-        self.tabview.pack(fill="both", expand=True, padx=16, pady=(8, 0))
+        self.tabview.pack(fill="both", expand=True, padx=PAD_LG, pady=(PAD_MD, 0))
+        try:
+            # CTkTabview não expõe uma API pública pra fonte do seletor de abas;
+            # isso é só um ajuste cosmético (abas maiores/mais legíveis), então
+            # se a versão instalada do customtkinter mudar esse atributo interno,
+            # falha silenciosamente em vez de quebrar a janela inteira.
+            self.tabview._segmented_button.configure(font=ctk.CTkFont(size=13, weight="bold"))
+        except Exception:
+            pass
         self._build_mapping_tab(self.tabview.add("  🎯  Mapeamento  "))
         self._build_settings_tab(self.tabview.add("  ⚙️  Configurações  "))
 
@@ -582,54 +764,58 @@ class LoLControllerApp(ctk.CTk):
         scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent",
                                         scrollbar_button_color=ACCENT_PRIMARY,
                                         scrollbar_button_hover_color=ACCENT_PRIMARY_HOVER)
-        scroll.pack(fill="both", expand=True, padx=4, pady=4)
+        scroll.pack(fill="both", expand=True, padx=PAD_XS, pady=PAD_XS)
 
         # Header + botões de ação
         header = ctk.CTkFrame(scroll, fg_color="transparent")
-        header.pack(fill="x", padx=4, pady=(8, 4))
+        header.pack(fill="x", padx=PAD_XS, pady=(PAD_SM, PAD_MD))
 
         title_col = ctk.CTkFrame(header, fg_color="transparent")
         title_col.pack(side="left", fill="y")
-        ctk.CTkLabel(title_col, text="Controle Visual",
-                     font=ctk.CTkFont(size=15, weight="bold"),
-                     text_color=TEXT_PRIMARY).pack(anchor="w")
+        kicker = ctk.CTkFrame(title_col, fg_color="transparent")
+        kicker.pack(anchor="w")
+        ctk.CTkFrame(kicker, fg_color=ACCENT_PRIMARY, width=4, height=20,
+                     corner_radius=2).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(kicker, text="Controle Visual",
+                     font=ctk.CTkFont(size=17, weight="bold"),
+                     text_color=TEXT_PRIMARY).pack(side="left")
         ctk.CTkLabel(title_col, text="Configure pelo controle físico ou clicando nos botões abaixo",
                      font=ctk.CTkFont(size=11),
-                     text_color=TEXT_MUTED).pack(anchor="w")
+                     text_color=TEXT_MUTED).pack(anchor="w", pady=(4, 0), padx=(12, 0))
 
         btn_row = ctk.CTkFrame(header, fg_color="transparent")
         btn_row.pack(side="right")
 
         # Botão Calibrar
         ctk.CTkButton(
-            btn_row, text="🔧  Calibrar", width=120, height=36, corner_radius=8,
+            btn_row, text="🔧  Calibrar", width=126, height=38, corner_radius=8,
             font=ctk.CTkFont(size=13, weight="bold"),
             fg_color=ACCENT_WARNING, hover_color="#d97706", text_color="#ffffff",
             command=self._open_calibration,
-        ).pack(side="left", padx=(0, 8))
+        ).pack(side="left", padx=(0, PAD_SM))
 
         # Botão Detectar
         self.detect_btn = ctk.CTkButton(
-            btn_row, text="🔍  Detectar", width=100, height=36, corner_radius=8,
+            btn_row, text="🔍  Detectar", width=106, height=38, corner_radius=8,
             font=ctk.CTkFont(size=13, weight="bold"),
             fg_color=ACCENT_PRIMARY, hover_color=ACCENT_PRIMARY_HOVER,
             text_color="#ffffff", command=self._toggle_detection,
         )
-        self.detect_btn.pack(side="left", padx=(0, 8))
+        self.detect_btn.pack(side="left", padx=(0, PAD_SM))
 
         # Botão Restaurar Padrões WASD
         ctk.CTkButton(
-            btn_row, text="🔄  Padrão WASD", width=130, height=36, corner_radius=8,
+            btn_row, text="🔄  Padrão WASD", width=134, height=38, corner_radius=8,
             font=ctk.CTkFont(size=13, weight="bold"),
             fg_color=BG_INPUT, hover_color=ACCENT_PRIMARY, text_color=TEXT_PRIMARY,
-            border_width=1, border_color=BORDER_COLOR,
+            border_width=1, border_color=BORDER_COLOR_STRONG,
             command=self._restore_wasd_defaults,
         ).pack(side="left")
 
         # Diagrama do Controle
         controller_card = ctk.CTkFrame(scroll, fg_color=BG_CARD, corner_radius=14,
                                        border_width=2, border_color=BORDER_COLOR)
-        controller_card.pack(fill="x", padx=4, pady=(8, 4))
+        controller_card.pack(fill="x", padx=PAD_XS, pady=(0, PAD_LG))
         self._build_controller_diagram(controller_card)
 
         # Barra do LoL HUD (Habilidades e Ações do Game)
@@ -640,27 +826,27 @@ class LoLControllerApp(ctk.CTk):
 
         # Salvar
         ctk.CTkButton(
-            scroll, text="💾  Salvar Mapeamento", height=42, corner_radius=10,
+            scroll, text="💾  Salvar Mapeamento", height=46, corner_radius=10,
             font=ctk.CTkFont(size=14, weight="bold"),
             fg_color=ACCENT_PRIMARY, hover_color=ACCENT_PRIMARY_HOVER,
             text_color="#ffffff", command=self._save_config,
-        ).pack(pady=(8, 16))
+        ).pack(pady=(PAD_LG, PAD_LG))
 
     def _build_controller_diagram(self, parent):
         diagram = ctk.CTkFrame(parent, fg_color="transparent")
-        diagram.pack(padx=20, pady=16, fill="x")
+        diagram.pack(padx=PAD_XL, pady=PAD_LG, fill="x")
 
         # Bumpers / Triggers (Agora L2 e R2 são mapeáveis e não bloqueados)
         bumpers = ctk.CTkFrame(diagram, fg_color="transparent")
-        bumpers.pack(fill="x", pady=(0, 10))
+        bumpers.pack(fill="x", pady=(0, PAD_MD))
         lb = ctk.CTkFrame(bumpers, fg_color="transparent")
-        lb.pack(side="left", padx=(10, 0))
-        self._make_ctrl_btn(lb, "L2", "L2", w=80, h=30).pack(pady=(0, 4))
-        self._make_ctrl_btn(lb, "L1", "L1", w=80, h=30).pack()
+        lb.pack(side="left", padx=(14, 0))
+        self._make_ctrl_btn(lb, "L2", "L2", w=84, h=32).pack(pady=(0, PAD_XS))
+        self._make_ctrl_btn(lb, "L1", "L1", w=84, h=32).pack()
         rb = ctk.CTkFrame(bumpers, fg_color="transparent")
-        rb.pack(side="right", padx=(0, 10))
-        self._make_ctrl_btn(rb, "R2", "R2", w=80, h=30).pack(pady=(0, 4))
-        self._make_ctrl_btn(rb, "R1", "R1", w=80, h=30).pack()
+        rb.pack(side="right", padx=(0, 14))
+        self._make_ctrl_btn(rb, "R2", "R2", w=84, h=32).pack(pady=(0, PAD_XS))
+        self._make_ctrl_btn(rb, "R1", "R1", w=84, h=32).pack()
 
         # Corpo
         body = ctk.CTkFrame(diagram, fg_color="transparent")
@@ -671,69 +857,69 @@ class LoLControllerApp(ctk.CTk):
 
         # D-Pad (Esquerda)
         dc = ctk.CTkFrame(body, fg_color="transparent")
-        dc.grid(row=0, column=0, padx=10, pady=8, sticky="n")
-        ctk.CTkLabel(dc, text="D-PAD", font=ctk.CTkFont(size=10, weight="bold"),
-                     text_color=TEXT_MUTED).pack(pady=(0, 4))
+        dc.grid(row=0, column=0, padx=PAD_MD, pady=PAD_SM, sticky="n")
+        ctk.CTkLabel(dc, text="D-PAD", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=TEXT_SECONDARY).pack(pady=(0, PAD_SM))
         self._build_cross(dc, ("DPAD_UP", "↑"), ("DPAD_LEFT", "←"),
                           ("DPAD_RIGHT", "→"), ("DPAD_DOWN", "↓"))
 
         # Analógicos, Select, Start (Centro)
         sc = ctk.CTkFrame(body, fg_color="transparent")
-        sc.grid(row=0, column=1, padx=10, pady=8)
+        sc.grid(row=0, column=1, padx=PAD_MD, pady=PAD_SM)
 
         # Botões Select / Start
         center_btns = ctk.CTkFrame(sc, fg_color="transparent")
-        center_btns.pack(pady=(0, 6))
-        self._make_ctrl_btn(center_btns, "SELECT", "SELECT", w=72, h=30).pack(side="left", padx=5)
-        self._make_ctrl_btn(center_btns, "START", "START", w=72, h=30).pack(side="left", padx=5)
+        center_btns.pack(pady=(0, PAD_MD))
+        self._make_ctrl_btn(center_btns, "SELECT", "SELECT", w=76, h=32).pack(side="left", padx=6)
+        self._make_ctrl_btn(center_btns, "START", "START", w=76, h=32).pack(side="left", padx=6)
 
-        ctk.CTkLabel(sc, text="ANALÓGICOS & L3/R3", font=ctk.CTkFont(size=10, weight="bold"),
-                     text_color=TEXT_MUTED).pack(pady=(0, 4))
+        ctk.CTkLabel(sc, text="ANALÓGICOS & L3/R3", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=TEXT_SECONDARY).pack(pady=(0, PAD_SM))
         sr = ctk.CTkFrame(sc, fg_color="transparent")
         sr.pack()
 
         left_stick_frame = ctk.CTkFrame(sr, fg_color="transparent")
-        left_stick_frame.pack(side="left", padx=10)
+        left_stick_frame.pack(side="left", padx=PAD_MD)
         self.left_stick = AnalogStickWidget(left_stick_frame, "Esquerdo (WASD)")
         self.left_stick.pack()
-        self._make_ctrl_btn(left_stick_frame, "L3", "L3", w=60, h=26).pack(pady=(4, 0))
+        self._make_ctrl_btn(left_stick_frame, "L3", "L3", w=64, h=28).pack(pady=(PAD_SM, 0))
 
         right_stick_frame = ctk.CTkFrame(sr, fg_color="transparent")
-        right_stick_frame.pack(side="left", padx=10)
+        right_stick_frame.pack(side="left", padx=PAD_MD)
         self.right_stick = AnalogStickWidget(right_stick_frame, "Direito (Mira)")
         self.right_stick.pack()
-        self._make_ctrl_btn(right_stick_frame, "R3", "R3", w=60, h=26).pack(pady=(4, 0))
+        self._make_ctrl_btn(right_stick_frame, "R3", "R3", w=64, h=28).pack(pady=(PAD_SM, 0))
 
         # Face Buttons (Direita)
         fc = ctk.CTkFrame(body, fg_color="transparent")
-        fc.grid(row=0, column=2, padx=10, pady=8, sticky="n")
-        ctk.CTkLabel(fc, text="BOTÕES DE AÇÃO", font=ctk.CTkFont(size=10, weight="bold"),
-                     text_color=TEXT_MUTED).pack(pady=(0, 4))
+        fc.grid(row=0, column=2, padx=PAD_MD, pady=PAD_SM, sticky="n")
+        ctk.CTkLabel(fc, text="BOTÕES DE AÇÃO", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=TEXT_SECONDARY).pack(pady=(0, PAD_SM))
         self._build_cross(fc, ("TRIANGLE", "△"), ("SQUARE", "□"),
                           ("CIRCLE", "○"), ("CROSS", "✕"))
 
     def _build_cross(self, parent, top, left, right, bottom):
         g = ctk.CTkFrame(parent, fg_color="transparent")
         g.pack()
-        self._make_ctrl_btn(g, top[0], top[1]).grid(row=0, column=1, padx=3, pady=3)
-        self._make_ctrl_btn(g, left[0], left[1]).grid(row=1, column=0, padx=3, pady=3)
-        self._make_ctrl_btn(g, right[0], right[1]).grid(row=1, column=2, padx=3, pady=3)
-        self._make_ctrl_btn(g, bottom[0], bottom[1]).grid(row=2, column=1, padx=3, pady=3)
+        self._make_ctrl_btn(g, top[0], top[1]).grid(row=0, column=1, padx=5, pady=5)
+        self._make_ctrl_btn(g, left[0], left[1]).grid(row=1, column=0, padx=5, pady=5)
+        self._make_ctrl_btn(g, right[0], right[1]).grid(row=1, column=2, padx=5, pady=5)
+        self._make_ctrl_btn(g, bottom[0], bottom[1]).grid(row=2, column=1, padx=5, pady=5)
 
-    def _make_ctrl_btn(self, parent, name, symbol, w=66, h=54, special=None):
-        is_mappable = name in config.MAPPING or name in ["L2", "R2", "L3", "R3", "START", "SELECT"]
+    def _make_ctrl_btn(self, parent, name, symbol, w=70, h=58, special=None):
+        is_mappable = name in config.MAPPING
         frame = ctk.CTkFrame(parent, fg_color=BG_INPUT, corner_radius=10,
                              border_width=2, border_color=BORDER_COLOR, width=w, height=h)
         frame.pack_propagate(False)
         sym = ctk.CTkLabel(frame, text=symbol,
-                           font=ctk.CTkFont(size=14 if len(symbol) <= 2 else 12, weight="bold"),
+                           font=ctk.CTkFont(size=15 if len(symbol) <= 2 else 12, weight="bold"),
                            text_color=TEXT_PRIMARY)
-        sym.pack(expand=True, fill="both", padx=2, pady=(4, 0))
-        mapped_text = special or (config.MAPPING.get(name, "—").upper() if is_mappable else "")
+        sym.pack(expand=True, fill="both", padx=2, pady=(6, 0))
+        mapped_text = special or (self._format_mapped_key(config.MAPPING.get(name, "")) if is_mappable else "")
         key_lbl = ctk.CTkLabel(frame, text=mapped_text,
-                               font=ctk.CTkFont(size=9, weight="bold"),
+                               font=ctk.CTkFont(size=10, weight="bold"),
                                text_color=ACCENT_SECONDARY)
-        key_lbl.pack(pady=(0, 4))
+        key_lbl.pack(pady=(0, 6))
 
         if is_mappable and not special:
             for w_item in [frame, sym, key_lbl]:
@@ -749,76 +935,88 @@ class LoLControllerApp(ctk.CTk):
     # ==========================================================================
     def _build_lol_hud(self, parent):
         hud_card = ctk.CTkFrame(
-            parent, fg_color="#0a0a16", corner_radius=12,
+            parent, fg_color="#0a0a16", corner_radius=14,
             border_width=2, border_color="#c8aa6e",
         )
-        hud_card.pack(fill="x", padx=4, pady=(8, 4))
+        hud_card.pack(fill="x", padx=PAD_XS, pady=(0, PAD_LG))
 
         inner = ctk.CTkFrame(hud_card, fg_color="transparent")
-        inner.pack(padx=16, pady=12, fill="x")
+        inner.pack(padx=PAD_LG, pady=PAD_MD, fill="x")
 
         header_row = ctk.CTkFrame(inner, fg_color="transparent")
-        header_row.pack(fill="x", pady=(0, 8))
+        header_row.pack(fill="x", pady=(0, PAD_MD))
         ctk.CTkLabel(
             header_row, text="🛡️  Barra de Ações do League of Legends ( HUD )",
-            font=ctk.CTkFont(size=13, weight="bold"), text_color="#c8aa6e",
-        ).pack(side="left")
+            font=ctk.CTkFont(size=14, weight="bold"), text_color="#e2c88f",
+        ).pack(anchor="w")
         ctk.CTkLabel(
-            header_row, text="Clique nos slots de habilidades para associar a um botão do controle",
-            font=ctk.CTkFont(size=10), text_color=TEXT_MUTED,
-        ).pack(side="left", padx=(10, 0))
+            header_row, text="Clique em um slot para associar a um botão do controle",
+            font=ctk.CTkFont(size=11), text_color=TEXT_MUTED,
+        ).pack(anchor="w", pady=(2, 0))
 
-        slots_row = ctk.CTkFrame(inner, fg_color="transparent")
-        slots_row.pack(fill="x")
+        # Duas linhas em vez de uma fileira única: 14 slots numa fileira só
+        # estouravam a largura da janela e ficavam cortados. Cada linha
+        # também ganhou um rótulo de grupo (antes só a cor diferenciava).
+        row1 = ctk.CTkFrame(inner, fg_color="transparent")
+        row1.pack(fill="x", pady=(0, PAD_MD))
+        row2 = ctk.CTkFrame(inner, fg_color="transparent")
+        row2.pack(fill="x")
 
         # Grupo 1: Habilidades Q-W-E-R do LoL WASD
-        group_skills = ctk.CTkFrame(slots_row, fg_color="transparent")
-        group_skills.pack(side="left", padx=(0, 10))
-        self._create_hud_slot(group_skills, "R-Click", "Hab. 1 (MB2)", color="#1e293b")
-        self._create_hud_slot(group_skills, "shift", "Hab. 2 (Shift)", color="#1e293b")
-        self._create_hud_slot(group_skills, "e", "Hab. 3 (E)", color="#1e293b")
-        self._create_hud_slot(group_skills, "r", "Ultimate (R)", color="#1e293b")
+        group_skills = self._hud_group(row1, "HABILIDADES")
+        self._create_hud_slot(group_skills, "R-Click", "Hab. 1\n(MB2)", color="#1e293b")
+        self._create_hud_slot(group_skills, "shift", "Hab. 2\n(Shift)", color="#1e293b")
+        self._create_hud_slot(group_skills, "e", "Hab. 3\n(E)", color="#1e293b")
+        self._create_hud_slot(group_skills, "r", "Ultimate\n(R)", color="#1e293b")
 
         # Grupo 2: Feitiços de Invocador do LoL WASD
-        group_summoners = ctk.CTkFrame(slots_row, fg_color="transparent")
-        group_summoners.pack(side="left", padx=(0, 10))
-        self._create_hud_slot(group_summoners, "q", "Feitiço 1 (Q)", color="#451a03")
-        self._create_hud_slot(group_summoners, "f", "Feitiço 2 (F)", color="#451a03")
+        group_summoners = self._hud_group(row1, "FEITIÇOS")
+        self._create_hud_slot(group_summoners, "q", "Feit. 1\n(Q)", color="#451a03")
+        self._create_hud_slot(group_summoners, "f", "Feit. 2\n(F)", color="#451a03")
 
         # Grupo 3: Itens Ativos 1-2-3-4
-        group_items = ctk.CTkFrame(slots_row, fg_color="transparent")
-        group_items.pack(side="left", padx=(0, 10))
+        group_items = self._hud_group(row2, "ITENS")
         for key in ["1", "2", "3"]:
-            self._create_hud_slot(group_items, key, f"Item {key}", color="#18181b")
-        self._create_hud_slot(group_items, "4", "Trinket (4)", color="#022c22")
+            self._create_hud_slot(group_items, key, f"Item\n{key}", color="#18181b")
+        self._create_hud_slot(group_items, "4", "Trinket\n(4)", color="#022c22")
 
         # Grupo 4: Ações Extras (Loja, Recall, Clique Esquerdo, Modificador)
-        group_utils = ctk.CTkFrame(slots_row, fg_color="transparent")
-        group_utils.pack(side="left")
-        self._create_hud_slot(group_utils, "p", "Loja (P)", color="#2e1065")
-        self._create_hud_slot(group_utils, "b", "Recall (B)", color="#172554")
-        self._create_hud_slot(group_utils, "L-Click", "Ataque Básico\n(Clique Esq.)", color="#7f1d1d")
-        self._create_hud_slot(group_utils, "Ctrl", "Upar Skill", color="#3b0764")
+        group_utils = self._hud_group(row2, "AÇÕES")
+        self._create_hud_slot(group_utils, "p", "Loja\n(P)", color="#2e1065")
+        self._create_hud_slot(group_utils, "b", "Recall\n(B)", color="#172554")
+        self._create_hud_slot(group_utils, "L-Click", "Ataque\n(Clique)", color="#7f1d1d")
+        self._create_hud_slot(group_utils, "Ctrl", "Upar\nSkill", color="#3b0764")
+
+    def _hud_group(self, parent, label_text):
+        """Coluna com um rótulo pequeno acima dos slots — reforça o
+        agrupamento que antes dependia só da cor de fundo dos slots."""
+        col = ctk.CTkFrame(parent, fg_color="transparent")
+        col.pack(side="left", padx=(0, PAD_LG))
+        ctk.CTkLabel(col, text=label_text, font=ctk.CTkFont(size=9, weight="bold"),
+                     text_color="#8a7550").pack(anchor="w", pady=(0, 4))
+        row = ctk.CTkFrame(col, fg_color="transparent")
+        row.pack()
+        return row
 
     def _create_hud_slot(self, parent, key_code, label_text, color):
         """Cria um slot visual na barra do LoL."""
         slot = ctk.CTkFrame(
             parent, fg_color=color, corner_radius=8,
-            border_width=1, border_color="#c8aa6e", width=54, height=54,
+            border_width=1, border_color="#c8aa6e", width=60, height=60,
         )
-        slot.pack(side="left", padx=2)
+        slot.pack(side="left", padx=3)
         slot.pack_propagate(False)
 
         lbl_key = ctk.CTkLabel(
             slot, text=label_text,
-            font=ctk.CTkFont(size=9, weight="bold"),
-            text_color="#ffffff",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#ffffff", justify="center",
         )
-        lbl_key.pack(pady=(4, 0))
+        lbl_key.pack(pady=(6, 0))
 
         lbl_btn = ctk.CTkLabel(
             slot, text="—",
-            font=ctk.CTkFont(size=8, weight="bold"),
+            font=ctk.CTkFont(size=9, weight="bold"),
             text_color="#c8aa6e",
         )
         lbl_btn.pack(expand=True)
@@ -838,6 +1036,9 @@ class LoLControllerApp(ctk.CTk):
     # --------------------------------------------------------------------------
     def _show_hud_remap_popup(self, key_code):
         """Abre popup para associar uma habilidade do LoL a um botão do controle."""
+        if self.is_running:
+            self._flash_status("⚠️  Pare o script antes de remapear", ACCENT_WARNING)
+            return
         popup = ctk.CTkToplevel(self)
         popup.title(f"Configurar Slot {key_code.upper()}")
         popup.geometry("380x250")
@@ -927,38 +1128,45 @@ class LoLControllerApp(ctk.CTk):
     def _build_detection_panel(self, parent):
         self.detection_card = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=12,
                                            border_width=1, border_color=BORDER_COLOR)
-        self.detection_card.pack(fill="x", padx=4, pady=4)
+        self.detection_card.pack(fill="x", padx=PAD_XS, pady=(0, PAD_LG))
         inner = ctk.CTkFrame(self.detection_card, fg_color="transparent")
-        inner.pack(fill="x", padx=16, pady=14)
+        inner.pack(fill="x", padx=PAD_LG, pady=PAD_MD)
         ctk.CTkLabel(inner, text="📡  Último Input Detectado",
                      font=ctk.CTkFont(size=13, weight="bold"),
                      text_color=TEXT_PRIMARY).pack(anchor="w")
+        ctk.CTkLabel(inner, text="Clique em '🔍 Detectar' acima e mexa no controle",
+                     font=ctk.CTkFont(size=11),
+                     text_color=TEXT_MUTED).pack(anchor="w", pady=(2, 0))
 
         g = ctk.CTkFrame(inner, fg_color="transparent")
-        g.pack(fill="x", pady=(8, 0))
+        g.pack(fill="x", pady=(PAD_MD, 0))
+        g.columnconfigure(0, weight=1)
         g.columnconfigure(1, weight=1)
+        g.columnconfigure(2, weight=1)
         g.columnconfigure(3, weight=1)
 
-        ctk.CTkLabel(g, text="Código:", font=ctk.CTkFont(size=11),
-                     text_color=TEXT_MUTED).grid(row=0, column=0, sticky="w", padx=(0, 6))
-        self.det_code = ctk.CTkLabel(g, text="—", font=ctk.CTkFont(size=11, weight="bold"),
-                                     text_color=TEXT_SECONDARY)
-        self.det_code.grid(row=0, column=1, sticky="w")
-        ctk.CTkLabel(g, text="Botão:", font=ctk.CTkFont(size=11),
-                     text_color=TEXT_MUTED).grid(row=1, column=0, sticky="w", padx=(0, 6))
-        self.det_button = ctk.CTkLabel(g, text="—", font=ctk.CTkFont(size=11, weight="bold"),
-                                       text_color=TEXT_SECONDARY)
-        self.det_button.grid(row=1, column=1, sticky="w")
-        ctk.CTkLabel(g, text="Tecla:", font=ctk.CTkFont(size=11),
-                     text_color=TEXT_MUTED).grid(row=0, column=2, sticky="w", padx=(20, 6))
-        self.det_key = ctk.CTkLabel(g, text="—", font=ctk.CTkFont(size=11, weight="bold"),
-                                    text_color=ACCENT_SECONDARY)
-        self.det_key.grid(row=0, column=3, sticky="w")
-        ctk.CTkLabel(g, text="Estado:", font=ctk.CTkFont(size=11),
-                     text_color=TEXT_MUTED).grid(row=1, column=2, sticky="w", padx=(20, 6))
-        self.det_state = ctk.CTkLabel(g, text="—", font=ctk.CTkFont(size=11, weight="bold"),
-                                      text_color=TEXT_SECONDARY)
-        self.det_state.grid(row=1, column=3, sticky="w")
+        self.det_code = self._build_det_chip(g, 0, "Código", TEXT_SECONDARY)
+        self.det_button = self._build_det_chip(g, 1, "Botão", TEXT_SECONDARY)
+        self.det_key = self._build_det_chip(g, 2, "Tecla", ACCENT_SECONDARY)
+        self.det_state = self._build_det_chip(g, 3, "Estado", TEXT_SECONDARY)
+
+    def _build_det_chip(self, parent, col, label_text, value_color):
+        """'Chip' (rótulo + valor em destaque numa pastilha) usado nos 4
+        campos do painel de detecção, no lugar do texto corrido anterior —
+        preenche o espaço da seção de forma mais legível e com mais peso
+        visual. Retorna o CTkLabel do valor para ser atualizado depois."""
+        cell = ctk.CTkFrame(parent, fg_color="transparent")
+        cell.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else PAD_SM, 0))
+        ctk.CTkLabel(cell, text=label_text.upper(), font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color=TEXT_MUTED).pack(anchor="w", pady=(0, 4))
+        chip = ctk.CTkFrame(cell, fg_color=BG_INPUT, corner_radius=8, height=40,
+                            border_width=1, border_color=BORDER_COLOR)
+        chip.pack(fill="x")
+        chip.pack_propagate(False)
+        value_lbl = ctk.CTkLabel(chip, text="—", font=ctk.CTkFont(size=13, weight="bold"),
+                                 text_color=value_color)
+        value_lbl.pack(expand=True)
+        return value_lbl
 
     # ==========================================================================
     # ABA DE CONFIGURAÇÕES
@@ -967,83 +1175,91 @@ class LoLControllerApp(ctk.CTk):
         scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent",
                                         scrollbar_button_color=ACCENT_PRIMARY,
                                         scrollbar_button_hover_color=ACCENT_PRIMARY_HOVER)
-        scroll.pack(fill="both", expand=True, padx=4, pady=4)
+        scroll.pack(fill="both", expand=True, padx=PAD_XS, pady=PAD_XS)
 
         # Resolução
         self._section_header(scroll, "Resolução da Tela", "Necessário para calcular o centro da mira")
         rc = self._card(scroll)
         ri = ctk.CTkFrame(rc, fg_color="transparent")
-        ri.pack(fill="x", padx=16, pady=14)
+        ri.pack(fill="x", padx=PAD_LG, pady=(PAD_MD, PAD_SM))
         ri.columnconfigure(1, weight=1)
         ri.columnconfigure(3, weight=1)
 
         ctk.CTkLabel(ri, text="Largura", font=ctk.CTkFont(size=12),
-                     text_color=TEXT_SECONDARY).grid(row=0, column=0, padx=(0, 8), sticky="w")
+                     text_color=TEXT_SECONDARY).grid(row=0, column=0, padx=(0, PAD_SM), sticky="w")
         self.setting_vars["SCREEN_WIDTH"] = ctk.StringVar(value=str(config.SCREEN_WIDTH))
         ctk.CTkEntry(ri, textvariable=self.setting_vars["SCREEN_WIDTH"],
-                     fg_color=BG_INPUT, border_color=BORDER_COLOR, text_color=TEXT_PRIMARY,
-                     font=ctk.CTkFont(size=13), corner_radius=8, height=36, width=120
-                     ).grid(row=0, column=1, padx=(0, 20), sticky="w")
+                     fg_color=BG_INPUT, border_color=BORDER_COLOR_STRONG, text_color=TEXT_PRIMARY,
+                     font=ctk.CTkFont(size=13), corner_radius=8, height=38, width=120
+                     ).grid(row=0, column=1, padx=(0, PAD_LG), sticky="w")
 
         ctk.CTkLabel(ri, text="Altura", font=ctk.CTkFont(size=12),
-                     text_color=TEXT_SECONDARY).grid(row=0, column=2, padx=(0, 8), sticky="w")
+                     text_color=TEXT_SECONDARY).grid(row=0, column=2, padx=(0, PAD_SM), sticky="w")
         self.setting_vars["SCREEN_HEIGHT"] = ctk.StringVar(value=str(config.SCREEN_HEIGHT))
         ctk.CTkEntry(ri, textvariable=self.setting_vars["SCREEN_HEIGHT"],
-                     fg_color=BG_INPUT, border_color=BORDER_COLOR, text_color=TEXT_PRIMARY,
-                     font=ctk.CTkFont(size=13), corner_radius=8, height=36, width=120
+                     fg_color=BG_INPUT, border_color=BORDER_COLOR_STRONG, text_color=TEXT_PRIMARY,
+                     font=ctk.CTkFont(size=13), corner_radius=8, height=38, width=120
                      ).grid(row=0, column=3, sticky="w")
 
         rb = ctk.CTkFrame(rc, fg_color="transparent")
-        rb.pack(fill="x", padx=16, pady=(0, 14))
+        rb.pack(fill="x", padx=PAD_LG, pady=(PAD_SM, PAD_MD))
+        ctk.CTkButton(rb, text="🖥  Detectar automaticamente", width=196, height=30, corner_radius=6,
+                      font=ctk.CTkFont(size=11, weight="bold"), fg_color=ACCENT_SECONDARY,
+                      hover_color="#0891b2", text_color="#ffffff",
+                      command=self._detect_resolution).pack(side="left", padx=(0, PAD_SM))
         for label, w, h in [("1920×1080", 1920, 1080), ("2560×1440", 2560, 1440), ("1366×768", 1366, 768)]:
-            ctk.CTkButton(rb, text=label, width=100, height=28, corner_radius=6,
+            ctk.CTkButton(rb, text=label, width=104, height=30, corner_radius=6,
                           font=ctk.CTkFont(size=11), fg_color=BG_INPUT, hover_color=ACCENT_PRIMARY,
-                          text_color=TEXT_SECONDARY, border_width=1, border_color=BORDER_COLOR,
-                          command=lambda _w=w, _h=h: self._set_res(_w, _h)).pack(side="left", padx=(0, 8))
+                          text_color=TEXT_SECONDARY, border_width=1, border_color=BORDER_COLOR_STRONG,
+                          command=lambda _w=w, _h=h: self._set_res(_w, _h)).pack(side="left", padx=(0, PAD_SM))
 
-        # --- Inversão de Analógicos (NOVO) ---
+        # --- Inversão de Analógicos ---
         self._section_header(scroll, "Inversão de Eixos dos Analógicos", "Configure caso o seu boneco ou mira andem ao contrário")
         inv_card = self._card(scroll)
         inv_inner = ctk.CTkFrame(inv_card, fg_color="transparent")
-        inv_inner.pack(fill="x", padx=16, pady=14)
+        inv_inner.pack(fill="x", padx=PAD_LG, pady=PAD_MD)
         inv_inner.columnconfigure(0, weight=1)
         inv_inner.columnconfigure(1, weight=1)
 
         # Analógico Esquerdo (WASD)
-        left_inv_frame = ctk.CTkFrame(inv_inner, fg_color="transparent")
-        left_inv_frame.grid(row=0, column=0, sticky="nsew", padx=10)
-        ctk.CTkLabel(left_inv_frame, text="Analógico Esquerdo (WASD)", font=ctk.CTkFont(size=12, weight="bold"), text_color=TEXT_PRIMARY).pack(anchor="w", pady=(0, 4))
-        
+        left_inv_frame = ctk.CTkFrame(inv_inner, fg_color=BG_INPUT, corner_radius=8)
+        left_inv_frame.grid(row=0, column=0, sticky="nsew", padx=(0, PAD_SM))
+        left_inv_inner = ctk.CTkFrame(left_inv_frame, fg_color="transparent")
+        left_inv_inner.pack(fill="both", expand=True, padx=PAD_MD, pady=PAD_SM)
+        ctk.CTkLabel(left_inv_inner, text="Analógico Esquerdo (WASD)", font=ctk.CTkFont(size=12, weight="bold"), text_color=TEXT_PRIMARY).pack(anchor="w", pady=(0, 6))
+
         self.inv_lx_var = tk.BooleanVar(value=config.CONTROLLER_LAYOUT.get("INVERT_LX", False))
-        ctk.CTkCheckBox(left_inv_frame, text="Inverter Horizontal (X)", variable=self.inv_lx_var, font=ctk.CTkFont(size=11), text_color=TEXT_SECONDARY, fg_color=ACCENT_PRIMARY).pack(anchor="w", pady=2)
-        
+        ctk.CTkCheckBox(left_inv_inner, text="Inverter Horizontal (X)", variable=self.inv_lx_var, font=ctk.CTkFont(size=11), text_color=TEXT_SECONDARY, fg_color=ACCENT_PRIMARY).pack(anchor="w", pady=3)
+
         self.inv_ly_var = tk.BooleanVar(value=config.CONTROLLER_LAYOUT.get("INVERT_LY", True))
-        ctk.CTkCheckBox(left_inv_frame, text="Inverter Vertical (Y)", variable=self.inv_ly_var, font=ctk.CTkFont(size=11), text_color=TEXT_SECONDARY, fg_color=ACCENT_PRIMARY).pack(anchor="w", pady=2)
+        ctk.CTkCheckBox(left_inv_inner, text="Inverter Vertical (Y)", variable=self.inv_ly_var, font=ctk.CTkFont(size=11), text_color=TEXT_SECONDARY, fg_color=ACCENT_PRIMARY).pack(anchor="w", pady=3)
 
         # Analógico Direito (Mira)
-        right_inv_frame = ctk.CTkFrame(inv_inner, fg_color="transparent")
-        right_inv_frame.grid(row=0, column=1, sticky="nsew", padx=10)
-        ctk.CTkLabel(right_inv_frame, text="Analógico Direito (Mira)", font=ctk.CTkFont(size=12, weight="bold"), text_color=TEXT_PRIMARY).pack(anchor="w", pady=(0, 4))
-        
+        right_inv_frame = ctk.CTkFrame(inv_inner, fg_color=BG_INPUT, corner_radius=8)
+        right_inv_frame.grid(row=0, column=1, sticky="nsew", padx=(PAD_SM, 0))
+        right_inv_inner = ctk.CTkFrame(right_inv_frame, fg_color="transparent")
+        right_inv_inner.pack(fill="both", expand=True, padx=PAD_MD, pady=PAD_SM)
+        ctk.CTkLabel(right_inv_inner, text="Analógico Direito (Mira)", font=ctk.CTkFont(size=12, weight="bold"), text_color=TEXT_PRIMARY).pack(anchor="w", pady=(0, 6))
+
         self.inv_rx_var = tk.BooleanVar(value=config.CONTROLLER_LAYOUT.get("INVERT_RX", False))
-        ctk.CTkCheckBox(right_inv_frame, text="Inverter Horizontal (X)", variable=self.inv_rx_var, font=ctk.CTkFont(size=11), text_color=TEXT_SECONDARY, fg_color=ACCENT_PRIMARY).pack(anchor="w", pady=2)
-        
+        ctk.CTkCheckBox(right_inv_inner, text="Inverter Horizontal (X)", variable=self.inv_rx_var, font=ctk.CTkFont(size=11), text_color=TEXT_SECONDARY, fg_color=ACCENT_PRIMARY).pack(anchor="w", pady=3)
+
         self.inv_ry_var = tk.BooleanVar(value=config.CONTROLLER_LAYOUT.get("INVERT_RY", True))
-        ctk.CTkCheckBox(right_inv_frame, text="Inverter Vertical (Y)", variable=self.inv_ry_var, font=ctk.CTkFont(size=11), text_color=TEXT_SECONDARY, fg_color=ACCENT_PRIMARY).pack(anchor="w", pady=2)
+        ctk.CTkCheckBox(right_inv_inner, text="Inverter Vertical (Y)", variable=self.inv_ry_var, font=ctk.CTkFont(size=11), text_color=TEXT_SECONDARY, fg_color=ACCENT_PRIMARY).pack(anchor="w", pady=3)
 
         # Mira
-        self._section_header(scroll, "Configurações da Mira", "Raio do círculo de mira ao redor do campeão")
+        self._section_header(scroll, "Configurações da Mira", "Raio do círculo de mira e retorno elástico ao centro")
         ac = self._card(scroll)
         ai = ctk.CTkFrame(ac, fg_color="transparent")
-        ai.pack(fill="x", padx=16, pady=14)
+        ai.pack(fill="x", padx=PAD_LG, pady=PAD_MD)
         ctk.CTkLabel(ai, text="Raio da Mira (pixels)", font=ctk.CTkFont(size=12),
                      text_color=TEXT_SECONDARY).pack(anchor="w")
         sf = ctk.CTkFrame(ai, fg_color="transparent")
-        sf.pack(fill="x", pady=(4, 0))
-        self.aim_lbl = ctk.CTkLabel(sf, text=str(config.AIM_RADIUS), width=50,
+        sf.pack(fill="x", pady=(6, 0))
+        self.aim_lbl = ctk.CTkLabel(sf, text=str(config.AIM_RADIUS), width=54,
                                     font=ctk.CTkFont(size=18, weight="bold"),
                                     text_color=ACCENT_SECONDARY)
-        self.aim_lbl.pack(side="right", padx=(12, 0))
+        self.aim_lbl.pack(side="right", padx=(PAD_SM, 0))
         self.aim_slider = ctk.CTkSlider(sf, from_=50, to=600, number_of_steps=55,
                                         progress_color=ACCENT_PRIMARY, button_color=ACCENT_SECONDARY,
                                         button_hover_color="#22d3ee", fg_color=BG_INPUT,
@@ -1051,17 +1267,35 @@ class LoLControllerApp(ctk.CTk):
         self.aim_slider.set(config.AIM_RADIUS)
         self.aim_slider.pack(fill="x", side="left", expand=True)
 
+        ctk.CTkFrame(ai, fg_color=BORDER_COLOR, height=1).pack(fill="x", pady=PAD_MD)
+
+        # Retorno Elástico ao Centro (animação ao soltar o analógico direito)
+        ctk.CTkLabel(ai, text="Retorno Elástico ao Centro (ms)", font=ctk.CTkFont(size=12),
+                     text_color=TEXT_SECONDARY).pack(anchor="w")
+        rf = ctk.CTkFrame(ai, fg_color="transparent")
+        rf.pack(fill="x", pady=(6, 0))
+        self.return_lbl = ctk.CTkLabel(rf, text=str(config.AIM_RETURN_MS), width=54,
+                                       font=ctk.CTkFont(size=18, weight="bold"),
+                                       text_color=ACCENT_SECONDARY)
+        self.return_lbl.pack(side="right", padx=(PAD_SM, 0))
+        self.return_slider = ctk.CTkSlider(rf, from_=0, to=300, number_of_steps=30,
+                                           progress_color=ACCENT_PRIMARY, button_color=ACCENT_SECONDARY,
+                                           button_hover_color="#22d3ee", fg_color=BG_INPUT,
+                                           command=lambda v: self.return_lbl.configure(text=str(int(v))))
+        self.return_slider.set(config.AIM_RETURN_MS)
+        self.return_slider.pack(fill="x", side="left", expand=True)
+
         # Deadzone
         self._section_header(scroll, "Zona Morta do Analógico", "Ignora movimentos leves para evitar drift")
         dc = self._card(scroll)
         di = ctk.CTkFrame(dc, fg_color="transparent")
-        di.pack(fill="x", padx=16, pady=14)
+        di.pack(fill="x", padx=PAD_LG, pady=PAD_MD)
         df = ctk.CTkFrame(di, fg_color="transparent")
         df.pack(fill="x")
-        self.dz_lbl = ctk.CTkLabel(df, text=f"{config.DEADZONE:.2f}", width=50,
+        self.dz_lbl = ctk.CTkLabel(df, text=f"{config.DEADZONE:.2f}", width=54,
                                    font=ctk.CTkFont(size=18, weight="bold"),
                                    text_color=ACCENT_SECONDARY)
-        self.dz_lbl.pack(side="right", padx=(12, 0))
+        self.dz_lbl.pack(side="right", padx=(PAD_SM, 0))
         self.dz_slider = ctk.CTkSlider(df, from_=0.05, to=0.5, number_of_steps=45,
                                        progress_color=ACCENT_PRIMARY, button_color=ACCENT_SECONDARY,
                                        button_hover_color="#22d3ee", fg_color=BG_INPUT,
@@ -1070,40 +1304,44 @@ class LoLControllerApp(ctk.CTk):
         self.dz_slider.pack(fill="x", side="left", expand=True)
 
         # Dicas
-        tf = ctk.CTkFrame(scroll, fg_color=BG_CARD, corner_radius=10,
+        tf = ctk.CTkFrame(scroll, fg_color=BG_CARD, corner_radius=12,
                           border_width=1, border_color=ACCENT_PRIMARY)
-        tf.pack(fill="x", padx=4, pady=(16, 4))
+        tf.pack(fill="x", padx=PAD_XS, pady=(PAD_LG, PAD_SM))
         ti = ctk.CTkFrame(tf, fg_color="transparent")
-        ti.pack(fill="x", padx=16, pady=14)
+        ti.pack(fill="x", padx=PAD_LG, pady=PAD_MD)
         ctk.CTkLabel(ti, text="💡  Dicas", font=ctk.CTkFont(size=13, weight="bold"),
                      text_color=ACCENT_PRIMARY).pack(anchor="w")
         ctk.CTkLabel(ti, text="•  Ação 'Ctrl' serve para upar habilidades (segure o botão + botão da habilidade)\n"
                               "•  Ação 'R-Click' simula o clique direito (Ataque Básico / Movimentação)\n"
                               "•  Analógico esquerdo = Movimentação (WASD)\n"
                               "•  Analógico direito = Mira (mouse proporcional com auto-retorno ao centro)\n"
+                              "•  Retorno Elástico: ao soltar o analógico direito, a mira volta suavemente ao\n"
+                              "    centro no tempo configurado (0 ms = volta instantânea, como antes)\n"
                               "•  Se a mira ou andar estiverem invertidos, ajuste acima nas inversões de analógico",
                      font=ctk.CTkFont(size=12), text_color=TEXT_SECONDARY,
-                     anchor="w", justify="left").pack(fill="x", pady=(4, 0))
+                     anchor="w", justify="left").pack(fill="x", pady=(8, 0))
 
-        ctk.CTkButton(scroll, text="💾  Salvar Configurações", height=42, corner_radius=10,
+        ctk.CTkButton(scroll, text="💾  Salvar Configurações", height=46, corner_radius=10,
                       font=ctk.CTkFont(size=14, weight="bold"),
                       fg_color=ACCENT_PRIMARY, hover_color=ACCENT_PRIMARY_HOVER,
-                      text_color="#ffffff", command=self._save_config).pack(pady=(12, 16))
+                      text_color="#ffffff", command=self._save_config).pack(pady=(PAD_LG, PAD_LG))
 
     # ==========================================================================
     # STATUS BAR
     # ==========================================================================
     def _build_status_bar(self):
-        sb = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=0, height=36)
+        sb = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=0, height=40)
         sb.pack(fill="x", side="bottom")
         sb.pack_propagate(False)
+        ctk.CTkFrame(self, fg_color=BORDER_COLOR_STRONG, height=1,
+                     corner_radius=0).pack(fill="x", side="bottom")
         inner = ctk.CTkFrame(sb, fg_color="transparent")
-        inner.pack(fill="both", expand=True, padx=16)
+        inner.pack(fill="both", expand=True, padx=PAD_LG)
         self.status_dot = ctk.CTkLabel(inner, text="●", font=ctk.CTkFont(size=10),
                                        text_color=TEXT_MUTED, width=16)
         self.status_dot.pack(side="left")
         self.status_label = ctk.CTkLabel(inner, text="Parado",
-                                         font=ctk.CTkFont(size=11), text_color=TEXT_MUTED)
+                                         font=ctk.CTkFont(size=11, weight="bold"), text_color=TEXT_MUTED)
         self.status_label.pack(side="left", padx=(4, 0))
         ctk.CTkLabel(inner, text=f"Config: {os.path.basename(config.CONFIG_FILE)}",
                      font=ctk.CTkFont(size=11), text_color=TEXT_MUTED).pack(side="right")
@@ -1113,22 +1351,38 @@ class LoLControllerApp(ctk.CTk):
     # ==========================================================================
     def _section_header(self, parent, title, subtitle=""):
         f = ctk.CTkFrame(parent, fg_color="transparent")
-        f.pack(fill="x", padx=4, pady=(16, 6))
-        ctk.CTkLabel(f, text=title, font=ctk.CTkFont(size=15, weight="bold"),
-                     text_color=TEXT_PRIMARY, anchor="w").pack(fill="x")
+        f.pack(fill="x", padx=PAD_XS, pady=(PAD_LG, PAD_SM))
+        kicker = ctk.CTkFrame(f, fg_color="transparent")
+        kicker.pack(fill="x")
+        ctk.CTkFrame(kicker, fg_color=ACCENT_PRIMARY, width=4, height=18,
+                     corner_radius=2).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(kicker, text=title, font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color=TEXT_PRIMARY, anchor="w").pack(side="left", fill="x")
         if subtitle:
             ctk.CTkLabel(f, text=subtitle, font=ctk.CTkFont(size=11),
-                         text_color=TEXT_MUTED, anchor="w").pack(fill="x")
+                         text_color=TEXT_MUTED, anchor="w").pack(fill="x", padx=(12, 0), pady=(3, 0))
 
     def _card(self, parent):
-        c = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=10,
+        c = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=12,
                          border_width=1, border_color=BORDER_COLOR)
-        c.pack(fill="x", padx=4, pady=(0, 4))
+        c.pack(fill="x", padx=PAD_XS, pady=(0, PAD_SM))
         return c
 
     def _set_res(self, w, h):
         self.setting_vars["SCREEN_WIDTH"].set(str(w))
         self.setting_vars["SCREEN_HEIGHT"].set(str(h))
+
+    def _detect_resolution(self):
+        """Preenche os campos de resolução com a resolução real detectada via
+        Win32 GetSystemMetrics, em vez de depender só de presets/digitação
+        manual (fonte do próprio user_config.json ter uma resolução digitada
+        errado, 1360x768, que não bate com nenhum preset do app)."""
+        res = _get_system_resolution()
+        if res:
+            self._set_res(*res)
+            self._flash_status(f"🖥  Resolução detectada: {res[0]}×{res[1]}", ACCENT_SUCCESS)
+        else:
+            self._flash_status("⚠️  Não foi possível detectar a resolução automaticamente", ACCENT_WARNING)
 
     def _flash_status(self, text, color):
         self.status_label.configure(text=text, text_color=color)
@@ -1138,17 +1392,29 @@ class LoLControllerApp(ctk.CTk):
     # CALIBRAÇÃO
     # ==========================================================================
     def _open_calibration(self):
+        """Abre o assistente de calibração (bloqueado enquanto o controle
+        está rodando; reentrante-seguro — um duplo-clique não abre dois
+        assistentes concorrentes lendo o mesmo gamepad)."""
         if self.detecting:
             self._stop_detection()
         if self.is_running:
             self._flash_status("⚠️  Pare o script antes de calibrar", ACCENT_WARNING)
             return
-        CalibrationWizard(self)
+        if self._calibration_wizard is not None:
+            try:
+                if self._calibration_wizard.winfo_exists():
+                    self._calibration_wizard.lift()
+                    self._calibration_wizard.focus_force()
+                    return
+            except Exception:
+                pass
+        self._calibration_wizard = CalibrationWizard(self)
 
     # ==========================================================================
     # DETECÇÃO (usa mapas dinâmicos)
     # ==========================================================================
     def _toggle_detection(self):
+        """Liga/desliga o painel de detecção ao vivo de input do gamepad."""
         if self.detecting:
             self._stop_detection()
         else:
@@ -1159,7 +1425,11 @@ class LoLControllerApp(ctk.CTk):
             self._flash_status("⚠️  Pare o script antes de detectar", ACCENT_WARNING)
             return
         self.detecting = True
-        self.detect_stop.clear()
+        # Event NOVO a cada início (não reutilizar+limpar o mesmo): um
+        # _detection_loop órfão da execução anterior — ainda bloqueado em
+        # get_gamepad() segurando o lock — continua observando o Event ANTIGO
+        # (já setado) e encerra, em vez de ressuscitar ao ver um flag "limpo".
+        self.detect_stop = threading.Event()
         self.detect_btn.configure(text="⏹  Parar", fg_color=ACCENT_DANGER, hover_color="#dc2626")
         self._flash_status("🔍  Detectando inputs...", ACCENT_SECONDARY)
         threading.Thread(target=self._detection_loop, daemon=True).start()
@@ -1177,23 +1447,43 @@ class LoLControllerApp(ctk.CTk):
         self.right_stick.update_position(0, 0)
 
     def _detection_loop(self):
+        # Captura o Event local: _start_detection cria um Event NOVO a cada
+        # início (para não ressuscitar um leitor órfão da execução anterior),
+        # então este laço deve observar o Event com que começou, não o
+        # self.detect_stop que pode já ter sido trocado por baixo dele.
+        stop = self.detect_stop
         try:
             from inputs import get_gamepad
         except ImportError:
             self.event_queue.put(("__error__", "Biblioteca 'inputs' não encontrada"))
             return
-        while not self.detect_stop.is_set():
-            try:
-                events = get_gamepad()
-                for ev in events:
-                    if ev.ev_type == "Sync":
-                        continue
-                    if self.detect_stop.is_set():
-                        break
-                    self.event_queue.put(ev)
-            except Exception as e:
-                self.event_queue.put(("__error__", str(e)))
+
+        # Mesmo lock global usado pelo CalibrationWizard — evita duas threads
+        # lendo o gamepad ao mesmo tempo (ex.: calibração aberta logo após
+        # parar a detecção, antes da thread anterior sair do get_gamepad()
+        # bloqueante). Espera o lock em vez de exibir erro fatal após 3s: o
+        # leitor anterior o solta assim que seu get_gamepad() retorna.
+        # Desistimos apenas se a detecção for parada antes de conseguir o lock.
+        while not stop.is_set():
+            if _gamepad_reader_lock.acquire(timeout=0.5):
                 break
+        else:
+            return
+        try:
+            while not stop.is_set():
+                try:
+                    events = get_gamepad()
+                    for ev in events:
+                        if ev.ev_type == "Sync":
+                            continue
+                        if stop.is_set():
+                            break
+                        self.event_queue.put(ev)
+                except Exception as e:
+                    self.event_queue.put(("__error__", str(e)))
+                    break
+        finally:
+            _gamepad_reader_lock.release()
 
     def _process_detection_queue(self):
         try:
@@ -1325,6 +1615,9 @@ class LoLControllerApp(ctk.CTk):
     # POPUP DE REMAP (DO DIAGRAMA DO CONTROLE)
     # ==========================================================================
     def _show_remap_popup(self, btn_name):
+        if self.is_running:
+            self._flash_status("⚠️  Pare o script antes de remapear", ACCENT_WARNING)
+            return
         popup = ctk.CTkToplevel(self)
         popup.title("Remapear Botão")
         popup.geometry("340x240")
@@ -1366,7 +1659,17 @@ class LoLControllerApp(ctk.CTk):
 
         def apply():
             selected = var.get()
-            config.MAPPING[btn_name] = "" if selected == "—" else selected
+            new_value = "" if selected == "—" else selected
+            # Limpa qualquer outro botão já associado a essa mesma tecla/ação
+            # antes de aplicar, espelhando o dedup de _show_hud_remap_popup —
+            # sem isso, dois botões físicos podiam ficar mapeados para a
+            # mesma tecla e o runtime (main.py) via um deles ser solto
+            # prematuramente enquanto o outro ainda estava pressionado.
+            if new_value:
+                for b, k in list(config.MAPPING.items()):
+                    if b != btn_name and k == new_value:
+                        config.MAPPING[b] = ""
+            config.MAPPING[btn_name] = new_value
             self._update_all_mappings_ui()
             popup.destroy()
             self._flash_status(f"✅  {BUTTON_LABELS.get(btn_name, btn_name)} → {selected.upper()}",
@@ -1386,6 +1689,8 @@ class LoLControllerApp(ctk.CTk):
     # SALVAR CONFIGURAÇÃO
     # ==========================================================================
     def _save_config(self):
+        """Lê os widgets da aba Configurações + o estado atual de config.MAPPING/
+        CONTROLLER_LAYOUT e persiste tudo em user_config.json."""
         try:
             sw = int(self.setting_vars["SCREEN_WIDTH"].get())
             sh = int(self.setting_vars["SCREEN_HEIGHT"].get())
@@ -1402,18 +1707,33 @@ class LoLControllerApp(ctk.CTk):
             "SCREEN_WIDTH": sw, "SCREEN_HEIGHT": sh,
             "AIM_RADIUS": int(self.aim_slider.get()),
             "DEADZONE": round(self.dz_slider.get(), 2),
+            "AIM_RETURN_MS": int(self.return_slider.get()),
             "POLL_RATE": config.POLL_RATE,
             "MAPPING": dict(config.MAPPING),
-            "MODIFIER_BTN": config.MODIFIER_BTN,
-            "ATTACK_BTN": config.ATTACK_BTN,
+            # MODIFIER_BTN/ATTACK_BTN propositalmente não são incluídos aqui:
+            # nenhum widget da GUI os altera e nenhum consumidor (main.py,
+            # wasd_logic.py, aim_math.py) os lê — são um ajuste "morto" que
+            # só ficava sendo lido/regravado sem efeito nenhum. Omitir do
+            # round-trip não muda comportamento (config.apply_config/
+            # load_config já usam DEFAULTS como fallback quando a chave não
+            # está presente no JSON).
             "CONTROLLER_LAYOUT": dict(config.CONTROLLER_LAYOUT),
         }
         config.apply_config(data)
-        config.save_config(data)
+        config.save_config()
         self._flash_status("✅  Configurações salvas!", ACCENT_SUCCESS)
 
     def _restore_wasd_defaults(self):
-        """Restaura as configurações de mapeamento para o padrão do LoL WASD."""
+        """Restaura o mapeamento de botões para o padrão LoL WASD.
+
+        Nota: config.save_config() chamado sem argumentos serializa TODA a
+        configuração atual em memória (resolução, mira, deadzone, layout do
+        controle etc.), não apenas o mapeamento — então este botão, apesar
+        do nome, sempre grava o estado completo em disco imediatamente.
+        """
+        if self.is_running:
+            self._flash_status("⚠️  Pare o script antes de remapear", ACCENT_WARNING)
+            return
         config.MAPPING = dict(config.DEFAULTS["MAPPING"])
         config.save_config()
         self._update_all_mappings_ui()
@@ -1429,40 +1749,106 @@ class LoLControllerApp(ctk.CTk):
             self._start_script()
 
     def _start_script(self):
+        """Salva a config atual e inicia o loop de controle (main.main) em
+        uma thread de segundo plano."""
         if self.detecting:
             self._stop_detection()
         self._save_config()
+        # Espera a execução anterior terminar seu cleanup() (soltar
+        # WASD/Ctrl/mouse) antes de começar a próxima, para as duas não se
+        # sobreporem soltando/segurando input ao mesmo tempo.
+        if self._controller_thread is not None and self._controller_thread.is_alive():
+            self._controller_thread.join(timeout=1.5)
+        # Event NOVO a cada início (não reutilizar+limpar o mesmo): um leitor de
+        # controle de main.py da execução anterior pode ter sobrevivido ao join
+        # (bloqueado dentro de get_gamepad() esperando um último evento). Se
+        # limpássemos o mesmo Event que ele ainda observa, ele voltaria a
+        # injetar input em paralelo com o novo leitor. Com um Event novo, o
+        # leitor órfão continua vendo o Event ANTIGO (ainda setado) e encerra.
+        stop_event = threading.Event()
+        self.stop_event = stop_event
         self.is_running = True
-        self.stop_event.clear()
         self.start_btn.configure(text="⏹  PARAR", fg_color=ACCENT_DANGER, hover_color="#dc2626")
-        self._flash_status("▶  Rodando — controle ativo", ACCENT_SUCCESS)
         self.detect_btn.configure(state="disabled", fg_color=BG_INPUT)
-        threading.Thread(target=self._run_controller, daemon=True).start()
+        # Sem privilégio de admin, o UIPI do Windows descarta silenciosamente o
+        # input sintético quando o LoL/Vanguard roda elevado — o usuário da GUI
+        # não vê o aviso que main.py só imprime no stdout. Surface aqui.
+        try:
+            is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            is_admin = True
+        if is_admin:
+            self._flash_status("▶  Rodando — controle ativo", ACCENT_SUCCESS)
+        else:
+            self._flash_status(
+                "⚠️  Rodando SEM admin — rode como Administrador se os comandos não funcionarem no jogo",
+                ACCENT_WARNING)
+        self._controller_thread = threading.Thread(
+            target=self._run_controller, args=(stop_event,), daemon=True)
+        self._controller_thread.start()
 
     def _stop_script(self):
+        """Sinaliza para main.main() parar (via stop_event) e restaura a UI.
+        Não bloqueia esperando a thread terminar — quem precisa disso (ex.:
+        fechar a janela) deve dar join() em self._controller_thread."""
         self.stop_event.set()
         self.is_running = False
         self.start_btn.configure(text="▶  INICIAR", fg_color=ACCENT_SUCCESS, hover_color="#0d9668")
         self._flash_status("Parado", TEXT_MUTED)
         self.detect_btn.configure(state="normal", fg_color=ACCENT_PRIMARY)
 
-    def _run_controller(self):
+    def _run_controller(self, stop_event):
+        # Não usar importlib.reload(config)/reload(main) aqui: main.main()
+        # já chama config.load_config() por conta própria a cada execução, e
+        # reload() re-executa o módulo do zero em memória compartilhada —
+        # nesse meio-tempo ele reseta config.MAPPING/CONTROLLER_LAYOUT/etc.
+        # para os hardcoded DEFAULTS antes de load_config() re-ler o arquivo,
+        # o que é uma corrida de dados se a thread da GUI ler config.* nesse
+        # instante (ex.: popups de remap, callbacks de detecção). reload()
+        # também não é thread-safe e não recarrega módulos importados
+        # transitivamente (aim_math/wasd_logic).
         try:
             import main
-            import importlib
-            importlib.reload(config)
-            importlib.reload(main)
-            main.main(stop_event=self.stop_event)
+            main.main(stop_event=stop_event)
         except Exception as e:
             print(f"[GUI] Erro: {e}")
         finally:
-            self.after(0, self._stop_script)
+            self.after(0, lambda: self._on_controller_exit(stop_event))
+
+    def _on_controller_exit(self, stop_event):
+        """Restaura a UI quando main.main() termina por conta própria (ex.:
+        controle desconectado). Só age se ESTA execução ainda for a atual —
+        uma execução antiga que só terminou depois de o usuário já ter
+        iniciado uma nova não deve parar a nova (seu stop_event não é mais o
+        vigente)."""
+        if stop_event is not self.stop_event:
+            return
+        if self.is_running:
+            self._stop_script()
 
     def _on_close(self):
         if self.is_running:
             self._stop_script()
+            # Threads daemon são mortas abruptamente quando o interpretador
+            # sai, sem chance de rodar o cleanup() (soltar WASD/Ctrl/mouse)
+            # de main.py — espera brevemente a thread do controle terminar
+            # antes de destruir a janela e deixar o processo sair.
+            if self._controller_thread is not None:
+                self._controller_thread.join(timeout=1.5)
         if self.detecting:
             self._stop_detection()
+        # Fecha o assistente de calibração aberto para que SEU próprio cleanup
+        # rode (seta detect_stop, cancela os jobs after() pendentes, solta o
+        # grab e libera o _gamepad_reader_lock) em vez de depender da
+        # destruição implícita do filho enquanto a thread leitora ainda segura
+        # o lock bloqueada em get_gamepad().
+        wiz = self._calibration_wizard
+        if wiz is not None:
+            try:
+                if wiz.winfo_exists():
+                    wiz._cancel()
+            except Exception:
+                pass
         self.destroy()
 
 

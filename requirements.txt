@@ -1,4 +1,6 @@
-inputs
-pydirectinput
-customtkinter
-Pillow
+# Windows only: relies on the 'inputs' package's XInput backend and on
+# pydirectinput/ctypes.windll for input injection and cursor positioning.
+inputs~=0.5
+pydirectinput~=1.0.4
+customtkinter~=5.2
+Pillow~=10.4
